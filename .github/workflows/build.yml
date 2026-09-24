@@ -1,0 +1,55 @@
+name: Build flood lookup data
+
+# Runs when:
+#  - the n8n "FEMA Flood Data Upload" form publishes a release with a FEMA "NFHL Data-County" zip attached, or
+#  - a zip is committed to incoming/ (e.g. with GitHub Desktop), or
+#  - on demand from the Actions tab.
+# Processed files go to data/. The uploaded zip is then deleted, so the repo stays small.
+on:
+  release:
+    types: [published]
+  push:
+    paths: ['incoming/**.zip']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-flood-data
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Fetch zip from the upload release
+        if: github.event_name == 'release'
+        run: gh release download "${{ github.event.release.tag_name }}" --repo "${{ github.repository }}" --pattern '*.zip' --dir incoming
+      - name: Process FEMA downloads
+        run: |
+          shopt -s nullglob
+          zips=(incoming/*.zip)
+          if [ ${#zips[@]} -eq 0 ]; then echo "Nothing to process"; exit 0; fi
+          python3 scripts/build.py "${zips[@]}"
+      - name: Commit updated data
+        run: |
+          git config user.name  "flood-data-bot"
+          git config user.email "flood-data-bot@users.noreply.github.com"
+          git rm -q --cached --ignore-unmatch incoming/*.zip
+          rm -f incoming/*.zip
+          git add data
+          if git diff --cached --quiet; then echo "No changes"; exit 0; fi
+          git commit -m "Update flood data ($(date +%Y-%m-%d))"
+          git push
+      - name: Delete the upload release
+        if: github.event_name == 'release' && success()
+        run: gh release delete "${{ github.event.release.tag_name }}" --repo "${{ github.repository }}" --yes --cleanup-tag
