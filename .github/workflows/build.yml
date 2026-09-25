@@ -1,10 +1,12 @@
 name: Build flood lookup data
 
 # Runs when:
-#  - the n8n "FEMA Flood Data Upload" form publishes a release with a FEMA "NFHL Data-County" zip attached, or
+#  - n8n publishes an "upload-..." release with a FEMA "NFHL Data-County" zip attached
+#    (from the FEMA Flood Data Upload form or the FEMA Zip Trimmer page),
 #  - a zip is committed to incoming/ (e.g. with GitHub Desktop), or
 #  - on demand from the Actions tab.
-# Processed files go to data/. The uploaded zip is then deleted, so the repo stays small.
+# Each run processes EVERY waiting upload release, so several counties sent back-to-back are all handled
+# even though GitHub only queues one extra run at a time. Uploaded zips are deleted afterwards.
 on:
   release:
     types: [published]
@@ -24,6 +26,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -31,25 +34,36 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Fetch zip from the upload release
-        if: github.event_name == 'release'
-        run: gh release download "${{ github.event.release.tag_name }}" --repo "${{ github.repository }}" --pattern '*.zip' --dir incoming
+      - name: Collect all waiting upload releases
+        run: |
+          mkdir -p incoming
+          gh release list --repo "$REPO" --limit 100 --json tagName --jq '.[].tagName | select(startswith("upload-"))' > upload_tags.txt || true
+          echo "Waiting uploads:"; cat upload_tags.txt
+          while read -r tag; do
+            [ -z "$tag" ] && continue
+            mkdir -p "incoming/$tag"
+            gh release download "$tag" --repo "$REPO" --pattern '*.zip' --dir "incoming/$tag" || echo "::warning::could not download $tag"
+          done < upload_tags.txt
       - name: Process FEMA downloads
         run: |
-          shopt -s nullglob
-          zips=(incoming/*.zip)
+          shopt -s nullglob globstar
+          zips=(incoming/**/*.zip)
           if [ ${#zips[@]} -eq 0 ]; then echo "Nothing to process"; exit 0; fi
           python3 scripts/build.py "${zips[@]}"
       - name: Commit updated data
         run: |
           git config user.name  "flood-data-bot"
           git config user.email "flood-data-bot@users.noreply.github.com"
-          git rm -q --cached --ignore-unmatch incoming/*.zip
-          rm -f incoming/*.zip
+          git rm -rq --cached --ignore-unmatch incoming/*.zip
+          find incoming -mindepth 1 ! -name .gitkeep -exec rm -rf {} + 2>/dev/null || true
           git add data
           if git diff --cached --quiet; then echo "No changes"; exit 0; fi
           git commit -m "Update flood data ($(date +%Y-%m-%d))"
           git push
-      - name: Delete the upload release
-        if: github.event_name == 'release' && success()
-        run: gh release delete "${{ github.event.release.tag_name }}" --repo "${{ github.repository }}" --yes --cleanup-tag
+      - name: Delete processed upload releases
+        if: success()
+        run: |
+          while read -r tag; do
+            [ -z "$tag" ] && continue
+            gh release delete "$tag" --repo "$REPO" --yes --cleanup-tag || true
+          done < upload_tags.txt
